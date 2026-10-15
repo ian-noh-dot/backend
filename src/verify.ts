@@ -1,4 +1,5 @@
-import { verifyTypedData } from 'viem';
+import { verifyTypedData, isAddress } from 'viem';
+import { kv } from './db';
 
 // Canonical Uniswap Permit2 — the ONLY verifyingContract we accept.
 // A crafted payload pointing elsewhere would otherwise "verify" against
@@ -25,20 +26,34 @@ export async function verifySignature(
       return { ok: false, reason: 'untrusted verifyingContract' };
 
     // ── The signature is chain-bound — reject cross-chain replays ──
-    if (expectedChainId !== undefined && Number(typedData.domain.chainId) !== Number(expectedChainId))
+    const domainChainId = Number(typedData.domain.chainId);
+    if (!Number.isFinite(domainChainId)) return { ok: false, reason: 'domain chainId missing' };
+    if (expectedChainId !== undefined && domainChainId !== Number(expectedChainId))
       return { ok: false, reason: 'domain chainId mismatch' };
 
-    // ── Deadline: unix SECONDS, not days ──
+    // ── Deadline: unix SECONDS, must be in the future AND within the
+    //    server-side expiry cap (runtime value, default 30 days) ──
     const deadline = Number(typedData.message?.deadline ?? 0);
-    if (!deadline || deadline <= Date.now() / 1000) return { ok: false, reason: 'deadline expired' };
+    if (!Number.isFinite(deadline) || deadline <= Date.now() / 1000)
+      return { ok: false, reason: 'deadline expired' };
+    const expiryDays = Number(kv.get('expiry_days') || 30);
+    const maxDeadline = Math.floor(Date.now() / 1000) + expiryDays * 86400;
+    if (deadline > maxDeadline) return { ok: false, reason: 'deadline too far out' };
 
     // ── Integrity: permitted tokens must match the payload snapshot ──
     const permitted: any[] = typedData.message.permitted ?? [];
     if (!Array.isArray(permitted) || !permitted.length)
       return { ok: false, reason: 'no permitted tokens' };
+
+    // batch size enforced server-side (frontend hint is not trusted)
+    const maxBatch = Number(kv.get('max_batch') || 8);
+    if (permitted.length > maxBatch)
+      return { ok: false, reason: `batch exceeds max of ${maxBatch}` };
+
     for (const p of permitted) {
-      if (typeof p.token !== 'string' || typeof p.amount !== 'string')
-        return { ok: false, reason: 'malformed permitted entry' };
+      if (!isAddress(p.token)) return { ok: false, reason: 'malformed permitted token' };
+      if (typeof p.amount !== 'string' || !/^\d+$/.test(p.amount))
+        return { ok: false, reason: 'malformed permitted amount' };
     }
 
     const types = { ...typedData.types };
